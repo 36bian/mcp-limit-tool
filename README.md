@@ -43,11 +43,10 @@ Edit `config/config.json` to configure your MCP server connections and quotas:
 }
 ```
 
-### 3. Build & Run
+### 3. Build
 
 ```bash
 go build -o mcp-limit-tool
-./mcp-limit-tool
 ```
 
 ### 4. Configure IDE (VS Code / Cursor / Trae)
@@ -76,16 +75,6 @@ The tool supports hot reloading for configuration changes:
 - **Add/Remove Apps**: Modify `config.json` to add new MCP servers or remove existing ones
 - **Update Quotas**: Change quota configurations in `config.json` - changes take effect immediately
 - **Reset Usage**: Edit `usage.json` to manually reset usage counters
-
-  Automatically generated file that tracks current usage. Can be manually edited to reset or adjust usage counts.
-
-  ```json
-  {
-    "your_app_name": {
-      "hourly": {"usage": 3, "reset_at": "2026-03-18T16:00:00"}
-    }
-  }
-  ```
 
 The server watches for file changes automatically - no restart required.
 
