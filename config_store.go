@@ -76,8 +76,8 @@ func NewConfigStore(basePath string, config *Config) (*ConfigStore, error) {
 
 	configPath := filepath.Join(cs.basePath, "config.json")
 	usagePath := filepath.Join(cs.basePath, "usage.json")
-	watcher.Add(configPath)
-	watcher.Add(usagePath)
+	watcher.Add(filepath.Dir(configPath))
+	watcher.Add(filepath.Dir(usagePath))
 
 	return cs, nil
 }
