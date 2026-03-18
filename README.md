@@ -38,7 +38,7 @@ Edit `config/config.json` to configure your MCP server connections and quotas:
       "daily": {"total": 500, "duration": "24h"},
       "weekly": {"total": 3000, "duration": "7d"},
       "monthly": {"total": 10000, "duration": "30d"},
-      "monthly": {"total": 50000, "duration": "1y"},
+      "yearly": {"total": 50000, "duration": "1y"},
       "once": {"total": 1000000, "duration": "unlimited"}
     }
   },
