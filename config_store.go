@@ -49,6 +49,8 @@ type QuotaPeriods struct {
 	Daily   *QuotaConfig `json:"daily,omitempty"`
 	Weekly  *QuotaConfig `json:"weekly,omitempty"`
 	Monthly *QuotaConfig `json:"monthly,omitempty"`
+	Yearly  *QuotaConfig `json:"yearly,omitempty"`
+	Once    *QuotaConfig `json:"once,omitempty"`
 }
 
 // NewConfigStore 创建配置存储
@@ -133,6 +135,8 @@ func (cs *ConfigStore) loadAll() {
 				{"daily", rateLimits["daily"], &quota.Daily},
 				{"weekly", rateLimits["weekly"], &quota.Weekly},
 				{"monthly", rateLimits["monthly"], &quota.Monthly},
+				{"yearly", rateLimits["yearly"], &quota.Yearly},
+				{"once", rateLimits["once"], &quota.Once},
 			}
 
 			for _, p := range periods {
@@ -228,6 +232,8 @@ func (cs *ConfigStore) reloadConfig(path string) error {
 			{"daily", rateLimits["daily"], &quota.Daily},
 			{"weekly", rateLimits["weekly"], &quota.Weekly},
 			{"monthly", rateLimits["monthly"], &quota.Monthly},
+			{"yearly", rateLimits["yearly"], &quota.Yearly},
+			{"once", rateLimits["once"], &quota.Once},
 		}
 
 		for _, p := range periods {
@@ -351,7 +357,7 @@ func (cs *ConfigStore) saveQuotas() {
 	defer cs.mu.RUnlock()
 
 	now := time.Now()
-	periodOrder := []string{"hourly", "daily", "weekly", "monthly"}
+	periodOrder := []string{"hourly", "daily", "weekly", "monthly", "yearly", "once"}
 
 	keys := make([]string, 0, len(cs.quotas))
 	for k := range cs.quotas {
@@ -385,6 +391,10 @@ func (cs *ConfigStore) saveQuotas() {
 				cfg = periods.Weekly
 			case "monthly":
 				cfg = periods.Monthly
+			case "yearly":
+				cfg = periods.Yearly
+			case "once":
+				cfg = periods.Once
 			}
 
 			// 过滤：limit 不存在则跳过
@@ -506,6 +516,8 @@ func (cs *ConfigStore) CheckAndInc(appName string) (allowed bool, details map[st
 		{"daily", appConfig.RateLimits["daily"], &quota.Daily},
 		{"weekly", appConfig.RateLimits["weekly"], &quota.Weekly},
 		{"monthly", appConfig.RateLimits["monthly"], &quota.Monthly},
+		{"yearly", appConfig.RateLimits["yearly"], &quota.Yearly},
+		{"once", appConfig.RateLimits["once"], &quota.Once},
 	}
 
 	for _, p := range periods {
@@ -607,6 +619,10 @@ func getNextPeriodStart(period string, now time.Time) time.Time {
 		return time.Date(now.Year(), now.Month(), now.Day()+daysUntilNext, 0, 0, 0, 0, now.Location())
 	case "monthly":
 		return time.Date(now.Year(), now.Month()+1, 1, 0, 0, 0, 0, now.Location())
+	case "yearly":
+		return time.Date(now.Year()+1, 1, 1, 0, 0, 0, 0, now.Location())
+	case "once":
+		return time.Date(2999, 1, 1, 0, 0, 0, 0, now.Location())
 	default:
 		return now.Add(time.Hour)
 	}
@@ -659,6 +675,8 @@ func (cs *ConfigStore) reloadQuotas(path string) error {
 			{"daily", rateLimits["daily"], &quota.Daily},
 			{"weekly", rateLimits["weekly"], &quota.Weekly},
 			{"monthly", rateLimits["monthly"], &quota.Monthly},
+			{"yearly", rateLimits["yearly"], &quota.Yearly},
+			{"once", rateLimits["once"], &quota.Once},
 		}
 
 		for _, p := range periods {
@@ -703,6 +721,10 @@ func getQuotaConfigByPeriod(quota *QuotaPeriods, period string) *QuotaConfig {
 		return quota.Weekly
 	case "monthly":
 		return quota.Monthly
+	case "yearly":
+		return quota.Yearly
+	case "once":
+		return quota.Once
 	default:
 		return nil
 	}

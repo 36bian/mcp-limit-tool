@@ -285,12 +285,16 @@ func (s *StdioMCPProxy) handleToolsCall(id interface{}, reqBody map[string]inter
 
 	if rateResult != nil && len(rateResult.Details) > 0 {
 		rateLimitInfo := "\n\n[mcp_limit_tool]:\n"
-		periodOrder := []string{"hourly", "daily", "weekly", "monthly"}
+		periodOrder := []string{"hourly", "daily", "weekly", "monthly", "yearly", "once"}
 
 		for _, period := range periodOrder {
 			if detail, ok := rateResult.Details[period]; ok {
 				usage := detail.Total - detail.Remaining
-				rateLimitInfo += fmt.Sprintf("%s %d/%d\n", period, usage, detail.Total)
+				if period == "once" {
+					rateLimitInfo += fmt.Sprintf("%d/%d\n", usage, detail.Total)
+				} else {
+					rateLimitInfo += fmt.Sprintf("%s %d/%d\n", period, usage, detail.Total)
+				}
 			}
 		}
 
@@ -331,7 +335,7 @@ func (s *StdioMCPProxy) createErrorResponse(id interface{}, code int, message st
 
 func (s *StdioMCPProxy) createRateLimitErrorResponse(id interface{}, result *RateLimitResult) string {
 	limitsData := make(map[string]interface{})
-	periodOrder := []string{"hourly", "daily", "weekly", "monthly"}
+	periodOrder := []string{"hourly", "daily", "weekly", "monthly", "yearly", "once"}
 
 	for _, period := range periodOrder {
 		if detail, ok := result.Details[period]; ok {
