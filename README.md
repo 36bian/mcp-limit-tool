@@ -4,7 +4,7 @@ A proxy server for MCP (Model Context Protocol) tools with quota management and 
 
 ## Features
 
-- **Quota Management**: Set hourly, daily, weekly or monthly usage quotas per MCP tool
+- **Quota Management**: Set hourly, daily, weekly, monthly, yearly or once usage quotas per MCP tool
 - **Tool Filtering**: Allowlist specific tools that clients can access
 - **Hot Reload**: Dynamically update configurations without restarting the server
 - **Usage Tracking**: Track and persist tool usage across restarts
@@ -17,6 +17,7 @@ A proxy server for MCP (Model Context Protocol) tools with quota management and 
 ```bash
 git clone https://github.com/36bian/mcp-limit-tool.git
 cd mcp-limit-tool
+go build -o mcp-limit-tool
 ```
 
 ### 2. Configure
@@ -36,20 +37,16 @@ Edit `config/config.json` to configure your MCP server connections and quotas:
       "hourly": {"total": 100, "duration": "1h"},
       "daily": {"total": 500, "duration": "24h"},
       "weekly": {"total": 3000, "duration": "7d"},
-      "monthly": {"total": 10000, "duration": "30d"}
+      "monthly": {"total": 10000, "duration": "30d"},
+      "monthly": {"total": 50000, "duration": "1y"},
+      "once": {"total": 1000000, "duration": "unlimited"}
     }
   },
   "second_app_name": {}
 }
 ```
 
-### 3. Build
-
-```bash
-go build -o mcp-limit-tool
-```
-
-### 4. Configure IDE (VS Code / Cursor / Trae)
+### 3. Configure IDE (VS Code / Cursor / Trae)
 
 Add the following to your IDE's MCP configuration. The `AppName` must match the app name defined in `config.json`:
 
