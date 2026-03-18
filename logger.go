@@ -11,35 +11,51 @@ import (
 var logger = &fileLogger{}
 
 type fileLogger struct {
-	logFile *os.File
-	logDir  string
-	mu      sync.Mutex
+	logFile     *os.File
+	logDir      string
+	appName     string
+	mu          sync.RWMutex
+	enableStderr bool
+	enableFile   bool
+	debugMode    bool
 }
 
-func (l *fileLogger) SetLogDir(dir string) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.logDir = dir
+type LogConfig struct {
+	AppName      string
+	LogDir       string
+	EnableStderr bool
+	EnableFile   bool
+	DebugMode    bool
 }
 
-func (l *fileLogger) init(appName string) {
+func (l *fileLogger) Configure(cfg LogConfig) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	l.appName = cfg.AppName
+	l.enableStderr = cfg.EnableStderr
+	l.enableFile = cfg.EnableFile
+	l.debugMode = cfg.DebugMode
+
+	if cfg.LogDir != "" {
+		l.logDir = cfg.LogDir
+	} else {
+		execPath, _ := os.Executable()
+		l.logDir = filepath.Join(filepath.Dir(execPath), "logs")
+	}
+
+	l.initLocked()
+}
+
+func (l *fileLogger) initLocked() {
 	if l.logFile != nil {
 		l.logFile.Close()
 		l.logFile = nil
 	}
 
-	var logDir string
-	if l.logDir != "" {
-		logDir = l.logDir
-	} else {
-		logDir = "tmp"
-	}
-	os.MkdirAll(logDir, 0755)
+	os.MkdirAll(l.logDir, 0755)
 
-	logPath := filepath.Join(logDir, fmt.Sprintf("%s.log", appName))
+	logPath := filepath.Join(l.logDir, fmt.Sprintf("%s.log", l.appName))
 
 	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
@@ -51,6 +67,16 @@ func (l *fileLogger) init(appName string) {
 
 func (l *fileLogger) Info(msg string) {
 	l.log(msg)
+}
+
+func (l *fileLogger) Debug(msg string) {
+	l.mu.RLock()
+	if l.debugMode {
+		l.mu.RUnlock()
+		l.log("[DEBUG] " + msg)
+	} else {
+		l.mu.RUnlock()
+	}
 }
 
 func (l *fileLogger) Warn(msg string) {
@@ -65,13 +91,21 @@ func (l *fileLogger) log(msg string) {
 	timestamp := time.Now().Format("2006-01-02 15:04:05.000")
 	line := fmt.Sprintf("[%s] %s\n", timestamp, msg)
 
-	fmt.Fprint(os.Stderr, line)
+	l.mu.RLock()
+	enableStderr := l.enableStderr
+	enableFile := l.enableFile
+	logFile := l.logFile
+	l.mu.RUnlock()
 
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.logFile != nil {
-		l.logFile.WriteString(line)
-		l.logFile.Sync()
+	if enableStderr {
+		fmt.Fprint(os.Stderr, line)
+	}
+
+	if enableFile && logFile != nil {
+		l.mu.Lock()
+		logFile.WriteString(line)
+		logFile.Sync()
+		l.mu.Unlock()
 	}
 }
 

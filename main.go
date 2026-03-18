@@ -54,22 +54,30 @@ func loadConfig(path string) (*Config, error) {
 func main() {
 	fmt.Fprintln(os.Stderr, "╔═══════════════════════════════════════════════════════════╗")
 	fmt.Fprintln(os.Stderr, "║                                                           ║")
-	fmt.Fprintln(os.Stderr, "║   Bifrost MCP Proxy - Lightweight MCP Gateway            ║")
+	fmt.Fprintln(os.Stderr, "║   MCP Limit Tool - Rate Limiter for MCP Gateway           ║")
 	fmt.Fprintln(os.Stderr, "║                                                           ║")
 	fmt.Fprintln(os.Stderr, "╚═══════════════════════════════════════════════════════════╝")
 
 	isDaemon := false
+	debugMode := false
 	for i := 1; i < len(os.Args); i++ {
 		if os.Args[i] == "-daemon" {
 			isDaemon = true
+		} else if os.Args[i] == "-debug" {
+			debugMode = true
 		}
 	}
 
-	if isDaemon {
-		logger.init("daemon")
-	} else {
-		logger.init("bootstrap")
+	logConfig := LogConfig{
+		AppName:      "bootstrap",
+		EnableStderr: debugMode,
+		EnableFile:   true,
+		DebugMode:    debugMode,
 	}
+	if isDaemon {
+		logConfig.AppName = "daemon"
+	}
+	logger.Configure(logConfig)
 
 	execPath, err := os.Executable()
 	if err != nil {
@@ -104,7 +112,7 @@ func main() {
 	}
 
 	if appName != "" {
-		logger.init(appName)
+		logger.Configure(LogConfig{AppName: appName})
 	}
 
 	config, err := loadConfig(configPath)

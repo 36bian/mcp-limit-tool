@@ -115,7 +115,7 @@ func startDaemonProcess(configPath string) error {
 
 	cmd := exec.Command(execPath, args...)
 
-	logDir := "tmp"
+	logDir := filepath.Join(filepath.Dir(execPath), "logs")
 	os.MkdirAll(logDir, 0755)
 	logPath := filepath.Join(logDir, "daemon-sys.log")
 
