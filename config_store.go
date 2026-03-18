@@ -356,7 +356,6 @@ func (cs *ConfigStore) saveQuotas() {
 	cs.mu.RLock()
 	defer cs.mu.RUnlock()
 
-	now := time.Now()
 	periodOrder := []string{"hourly", "daily", "weekly", "monthly", "yearly", "once"}
 
 	keys := make([]string, 0, len(cs.quotas))
@@ -403,11 +402,7 @@ func (cs *ConfigStore) saveQuotas() {
 				continue
 			}
 
-			// 过滤：reset 值不匹配则跳过（不保存无效数据）
-			if cfg != nil && !isValidUsage(cfg, limitCfg, p, now) {
-				continue
-			}
-
+			// 保存所有有配置的数据（包括周期已过的，会在 CheckAndInc 中处理重置）
 			if cfg != nil {
 				periodData[p] = cfg
 				hasValidPeriod = true
@@ -529,24 +524,17 @@ func (cs *ConfigStore) CheckAndInc(appName string) (allowed bool, details map[st
 		}
 		qState := *p.state
 
-		// 4. 线程处理时，有效数据保留，无效数据不覆盖
-		if isValidUsage(qState, p.limit, p.name, now) {
-			if now.After(qState.ResetAt) {
-				qState.Usage = 0
-				qState.Remaining = p.limit.Total
-				qState.ResetAt = getNextPeriodStart(p.name, now)
-			} else {
-				qState.Remaining = p.limit.Total - qState.Usage
-				if qState.Remaining < 0 {
-					qState.Remaining = 0
-				}
-			}
+		// 修复：根据时间判断是否重置，而不是依赖 isValidUsage
+		// 如果 reset_at 是零值或周期已过，重置计数
+		if qState.ResetAt.IsZero() || now.After(qState.ResetAt) {
+			qState.Usage = 0
+			qState.Remaining = p.limit.Total
+			qState.ResetAt = getNextPeriodStart(p.name, now)
 		} else {
-			// 无视：保持原值不变（不覆盖）
-			if qState.Usage == 0 && qState.Remaining == 0 && qState.ResetAt.IsZero() {
-				qState.Usage = 0
-				qState.Remaining = p.limit.Total
-				qState.ResetAt = getNextPeriodStart(p.name, now)
+			// 周期内，更新 remain
+			qState.Remaining = p.limit.Total - qState.Usage
+			if qState.Remaining < 0 {
+				qState.Remaining = 0
 			}
 		}
 	}
