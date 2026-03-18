@@ -71,7 +71,7 @@ func main() {
 	logConfig := LogConfig{
 		AppName:      "bootstrap",
 		EnableStderr: debugMode,
-		EnableFile:   true,
+		EnableFile:   debugMode,
 		DebugMode:    debugMode,
 	}
 	if isDaemon {
@@ -112,7 +112,12 @@ func main() {
 	}
 
 	if appName != "" {
-		logger.Configure(LogConfig{AppName: appName})
+		logger.Configure(LogConfig{
+			AppName:      appName,
+			EnableStderr: debugMode,
+			EnableFile:   debugMode,
+			DebugMode:    debugMode,
+		})
 	}
 
 	config, err := loadConfig(configPath)
@@ -151,7 +156,7 @@ func main() {
 	}
 
 	logger.Info(fmt.Sprintf("[%s] Starting daemon process...", appName))
-	if err := startDaemonProcess(configPath); err != nil {
+	if err := startDaemonProcess(configPath, debugMode); err != nil {
 		logger.Error(fmt.Sprintf("failed to start daemon: %v", err))
 		os.Exit(1)
 	}

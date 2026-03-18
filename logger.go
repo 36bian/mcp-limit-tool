@@ -44,7 +44,14 @@ func (l *fileLogger) Configure(cfg LogConfig) {
 		l.logDir = filepath.Join(filepath.Dir(execPath), "logs")
 	}
 
-	l.initLocked()
+	if l.enableFile {
+		l.initLocked()
+	} else {
+		if l.logFile != nil {
+			l.logFile.Close()
+			l.logFile = nil
+		}
+	}
 }
 
 func (l *fileLogger) initLocked() {

@@ -102,26 +102,34 @@ func (ds *DaemonServer) removeConnection() {
 }
 
 // startDaemonProcess 启动守护进程
-func startDaemonProcess(configPath string) error {
+func startDaemonProcess(configPath string, debugMode bool) error {
 	execPath, err := os.Executable()
 	if err != nil {
 		return err
 	}
 
 	args := []string{"-daemon"}
+	if debugMode {
+		args = append(args, "-debug")
+	}
 	if configPath != "" {
 		args = append(args, "-config", configPath)
 	}
 
 	cmd := exec.Command(execPath, args...)
 
-	logDir := filepath.Join(filepath.Dir(execPath), "logs")
-	os.MkdirAll(logDir, 0755)
-	logPath := filepath.Join(logDir, "daemon-sys.log")
+	if debugMode {
+		logDir := filepath.Join(filepath.Dir(execPath), "logs")
+		os.MkdirAll(logDir, 0755)
+		logPath := filepath.Join(logDir, "daemon-sys.log")
 
-	if f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err == nil {
-		cmd.Stdout = f
-		cmd.Stderr = f
+		if f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err == nil {
+			cmd.Stdout = f
+			cmd.Stderr = f
+		} else {
+			cmd.Stdout = nil
+			cmd.Stderr = nil
+		}
 	} else {
 		cmd.Stdout = nil
 		cmd.Stderr = nil
