@@ -115,7 +115,10 @@ func startDaemonProcess(configPath string) error {
 
 	cmd := exec.Command(execPath, args...)
 
-	logPath := filepath.Join(os.TempDir(), "mcp-daemon-sys.log")
+	logDir := "tmp"
+	os.MkdirAll(logDir, 0755)
+	logPath := filepath.Join(logDir, "daemon-sys.log")
+
 	if f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err == nil {
 		cmd.Stdout = f
 		cmd.Stderr = f

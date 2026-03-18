@@ -96,9 +96,14 @@ func (cs *ConfigStore) loadAll() {
 	defer cs.mu.Unlock()
 
 	now := time.Now()
+	logger.Info("=== loadAll called ===")
 
+	// 1. 程序启动时发现没有，自动创建
 	if data, err := os.ReadFile(filepath.Join(cs.basePath, "auto_usage.json")); err == nil {
+		logger.Info("auto_usage.json content: " + string(data))
 		sonic.Unmarshal(data, &cs.quotas)
+	} else {
+		logger.Info("No auto_usage.json found, will create new")
 	}
 
 	if cs.quotas == nil {
@@ -116,79 +121,56 @@ func (cs *ConfigStore) loadAll() {
 			if _, exists := cs.quotas[appName]; !exists {
 				cs.quotas[appName] = &QuotaPeriods{}
 			}
-			cs.reconcileQuota(cs.quotas[appName], appConfig.RateLimits, now)
+			quota := cs.quotas[appName]
+			rateLimits := appConfig.RateLimits
+
+			periods := []struct {
+				name   string
+				limit  *RateLimitConfig
+				target **QuotaConfig
+			}{
+				{"hourly", rateLimits["hourly"], &quota.Hourly},
+				{"daily", rateLimits["daily"], &quota.Daily},
+				{"weekly", rateLimits["weekly"], &quota.Weekly},
+				{"monthly", rateLimits["monthly"], &quota.Monthly},
+			}
+
+			for _, p := range periods {
+				if p.limit == nil || p.limit.Total <= 0 {
+					*p.target = nil
+					continue
+				}
+				if *p.target == nil {
+					*p.target = &QuotaConfig{}
+				}
+				qCfg := *p.target
+
+				// 2. 程序启动时发现存在，走自动更新逻辑
+				// 有效定义：app匹配-limit规则匹配-reset值匹配
+				if isValidUsage(qCfg, p.limit, p.name, now) {
+					qCfg.Remaining = p.limit.Total - qCfg.Usage
+					if qCfg.Remaining < 0 {
+						qCfg.Remaining = 0
+					}
+				} else {
+					// 无视：保持原值不变（不覆盖）
+					// 只有第一次创建或者完全没有数据时才初始化
+					if qCfg.Usage == 0 && qCfg.Remaining == 0 && qCfg.ResetAt.IsZero() {
+						qCfg.Remaining = p.limit.Total
+						qCfg.ResetAt = getNextPeriodStart(p.name, now)
+					}
+				}
+			}
 		}
 	}
 }
 
-// reconcileQuota 对齐单个 App 的限流周期
-func (cs *ConfigStore) reconcileQuota(quota *QuotaPeriods, rateLimits map[string]*RateLimitConfig, now time.Time) {
-	if rateLimits == nil {
-		quota.Hourly = nil
-		quota.Daily = nil
-		quota.Weekly = nil
-		quota.Monthly = nil
-		return
+func isValidUsage(qCfg *QuotaConfig, limitCfg *RateLimitConfig, period string, now time.Time) bool {
+	if qCfg == nil || limitCfg == nil || limitCfg.Total <= 0 {
+		return false
 	}
-
-	if _, ok := rateLimits["hourly"]; !ok {
-		quota.Hourly = nil
-	}
-	if _, ok := rateLimits["daily"]; !ok {
-		quota.Daily = nil
-	}
-	if _, ok := rateLimits["weekly"]; !ok {
-		quota.Weekly = nil
-	}
-	if _, ok := rateLimits["monthly"]; !ok {
-		quota.Monthly = nil
-	}
-
-	for period, limitConfig := range rateLimits {
-		if limitConfig == nil || limitConfig.Total <= 0 {
-			continue
-		}
-
-		var quotaConfig *QuotaConfig
-		switch period {
-		case "hourly":
-			if quota.Hourly == nil {
-				quota.Hourly = &QuotaConfig{}
-			}
-			quotaConfig = quota.Hourly
-		case "daily":
-			if quota.Daily == nil {
-				quota.Daily = &QuotaConfig{}
-			}
-			quotaConfig = quota.Daily
-		case "weekly":
-			if quota.Weekly == nil {
-				quota.Weekly = &QuotaConfig{}
-			}
-			quotaConfig = quota.Weekly
-		case "monthly":
-			if quota.Monthly == nil {
-				quota.Monthly = &QuotaConfig{}
-			}
-			quotaConfig = quota.Monthly
-		}
-
-		if quotaConfig == nil {
-			continue
-		}
-
-		if quotaConfig.ResetAt.IsZero() {
-			quotaConfig.Usage = 0
-			quotaConfig.Remaining = limitConfig.Total
-			quotaConfig.ResetAt = getNextPeriodStart(period, now)
-		} else if now.After(quotaConfig.ResetAt) {
-			quotaConfig.Usage = 0
-			quotaConfig.Remaining = limitConfig.Total
-			quotaConfig.ResetAt = getNextPeriodStart(period, now)
-		} else {
-			quotaConfig.Remaining = limitConfig.Total - quotaConfig.Usage
-		}
-	}
+	expectedReset := getNextPeriodStart(period, now)
+	return qCfg.ResetAt.Equal(expectedReset)
 }
 
 // reloadConfig 重新加载配置文件
@@ -234,7 +216,47 @@ func (cs *ConfigStore) reloadConfig(path string) error {
 		if _, exists := cs.quotas[appName]; !exists {
 			cs.quotas[appName] = &QuotaPeriods{}
 		}
-		cs.reconcileQuota(cs.quotas[appName], appConfig.RateLimits, now)
+		quota := cs.quotas[appName]
+		rateLimits := appConfig.RateLimits
+
+		periods := []struct {
+			name   string
+			limit  *RateLimitConfig
+			target **QuotaConfig
+		}{
+			{"hourly", rateLimits["hourly"], &quota.Hourly},
+			{"daily", rateLimits["daily"], &quota.Daily},
+			{"weekly", rateLimits["weekly"], &quota.Weekly},
+			{"monthly", rateLimits["monthly"], &quota.Monthly},
+		}
+
+		for _, p := range periods {
+			if p.limit == nil || p.limit.Total <= 0 {
+				*p.target = nil
+				continue
+			}
+			if *p.target == nil {
+				*p.target = &QuotaConfig{}
+			}
+			qCfg := *p.target
+
+			// config 更新时，走自动更新逻辑
+			// 有效定义：app匹配-limit规则匹配-reset值匹配
+			if isValidUsage(qCfg, p.limit, p.name, now) {
+				qCfg.Remaining = p.limit.Total - qCfg.Usage
+				if qCfg.Remaining < 0 {
+					qCfg.Remaining = 0
+				}
+			} else {
+				// 无视：保持原值不变（不覆盖）
+				// 只有第一次创建或者完全没有数据时才初始化
+				if qCfg.Usage == 0 && qCfg.Remaining == 0 && qCfg.ResetAt.IsZero() {
+					qCfg.Usage = 0
+					qCfg.Remaining = p.limit.Total
+					qCfg.ResetAt = getNextPeriodStart(p.name, now)
+				}
+			}
+		}
 	}
 	cs.mu.Unlock()
 
@@ -303,13 +325,8 @@ func (cs *ConfigStore) watch() {
 
 // autoSave 包含防抖机制的自动保存协程
 func (cs *ConfigStore) autoSave() {
-	ticker := time.NewTicker(5 * time.Minute)
-	defer ticker.Stop()
-
 	for {
 		select {
-		case <-ticker.C:
-			cs.saveQuotas()
 		case <-cs.saveChan:
 			time.Sleep(100 * time.Millisecond)
 		drainChan:
@@ -328,26 +345,35 @@ func (cs *ConfigStore) autoSave() {
 	}
 }
 
-// saveQuotas 保存 quotas 到文件
+// saveQuotas 保存 quotas 到文件（只保存有效数据）
 func (cs *ConfigStore) saveQuotas() {
 	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+
+	now := time.Now()
+	periodOrder := []string{"hourly", "daily", "weekly", "monthly"}
+
 	keys := make([]string, 0, len(cs.quotas))
 	for k := range cs.quotas {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 
-	periodOrder := []string{"hourly", "daily", "weekly", "monthly"}
-
 	var buf strings.Builder
 	buf.WriteString("{\n")
-	for i, app := range keys {
-		if i > 0 {
-			buf.WriteString(",\n")
+
+	firstApp := true
+	for _, appName := range keys {
+		// 过滤：app 不存在则跳过
+		appConfig, exists := cs.config.ClientRegistry[appName]
+		if !exists {
+			continue
 		}
-		buf.WriteString(fmt.Sprintf(`  "%s": {`, app))
-		periods := cs.quotas[app]
-		first := true
+
+		periods := cs.quotas[appName]
+		hasValidPeriod := false
+		periodData := make(map[string]*QuotaConfig)
+
 		for _, p := range periodOrder {
 			var cfg *QuotaConfig
 			switch p {
@@ -360,15 +386,48 @@ func (cs *ConfigStore) saveQuotas() {
 			case "monthly":
 				cfg = periods.Monthly
 			}
-			if cfg == nil {
+
+			// 过滤：limit 不存在则跳过
+			limitCfg := appConfig.RateLimits[p]
+			if limitCfg == nil || limitCfg.Total <= 0 {
 				continue
 			}
-			if first {
+
+			// 过滤：reset 值不匹配则跳过（不保存无效数据）
+			if cfg != nil && !isValidUsage(cfg, limitCfg, p, now) {
+				continue
+			}
+
+			if cfg != nil {
+				periodData[p] = cfg
+				hasValidPeriod = true
+			}
+		}
+
+		if !hasValidPeriod {
+			continue
+		}
+
+		if !firstApp {
+			buf.WriteString(",\n")
+		}
+		firstApp = false
+
+		buf.WriteString(fmt.Sprintf(`  "%s": {`, appName))
+		firstPeriod := true
+		for _, p := range periodOrder {
+			cfg, ok := periodData[p]
+			if !ok {
+				continue
+			}
+
+			if firstPeriod {
 				buf.WriteString("\n")
 			} else {
 				buf.WriteString(",\n")
 			}
-			first = false
+			firstPeriod = false
+
 			if !cfg.ResetAt.IsZero() {
 				buf.WriteString(fmt.Sprintf(`    "%s": {"usage": %d, "remain": %d, "reset_at": "%s"}`,
 					p, cfg.Usage, cfg.Remaining, cfg.ResetAt.Format(time.RFC3339)))
@@ -377,7 +436,7 @@ func (cs *ConfigStore) saveQuotas() {
 					p, cfg.Usage, cfg.Remaining))
 			}
 		}
-		if first {
+		if firstPeriod {
 			buf.WriteString("}")
 		} else {
 			buf.WriteString("\n  }")
@@ -385,7 +444,7 @@ func (cs *ConfigStore) saveQuotas() {
 	}
 	buf.WriteString("\n}")
 
-	cs.mu.RUnlock()
+	logger.Info("saveQuotas content: " + buf.String())
 
 	path := filepath.Join(cs.basePath, "auto_usage.json")
 	tmpPath := path + ".tmp"
@@ -434,13 +493,9 @@ func (cs *ConfigStore) CheckAndInc(appName string) (allowed bool, details map[st
 	if quota == nil {
 		quota = &QuotaPeriods{}
 		cs.quotas[appName] = quota
-		cs.reconcileQuota(quota, appConfig.RateLimits, time.Now())
 	}
 
 	now := time.Now()
-	details = make(map[string]*PeriodDetail)
-	allowed = true
-	var blockedBy string
 
 	periods := []struct {
 		name     string
@@ -454,17 +509,45 @@ func (cs *ConfigStore) CheckAndInc(appName string) (allowed bool, details map[st
 	}
 
 	for _, p := range periods {
-		if p.limit == nil || p.limit.Total <= 0 || *p.state == nil {
+		if p.limit == nil || p.limit.Total <= 0 {
 			continue
+		}
+		if *p.state == nil {
+			*p.state = &QuotaConfig{}
 		}
 		qState := *p.state
 
-		if now.After(qState.ResetAt) {
-			qState.Usage = 0
-			qState.Remaining = p.limit.Total
-			qState.ResetAt = getNextPeriodStart(p.name, now)
+		// 4. 线程处理时，有效数据保留，无效数据不覆盖
+		if isValidUsage(qState, p.limit, p.name, now) {
+			if now.After(qState.ResetAt) {
+				qState.Usage = 0
+				qState.Remaining = p.limit.Total
+				qState.ResetAt = getNextPeriodStart(p.name, now)
+			} else {
+				qState.Remaining = p.limit.Total - qState.Usage
+				if qState.Remaining < 0 {
+					qState.Remaining = 0
+				}
+			}
+		} else {
+			// 无视：保持原值不变（不覆盖）
+			if qState.Usage == 0 && qState.Remaining == 0 && qState.ResetAt.IsZero() {
+				qState.Usage = 0
+				qState.Remaining = p.limit.Total
+				qState.ResetAt = getNextPeriodStart(p.name, now)
+			}
 		}
+	}
 
+	details = make(map[string]*PeriodDetail)
+	allowed = true
+	var blockedBy string
+
+	for _, p := range periods {
+		qState := *p.state
+		if qState == nil {
+			continue
+		}
 		remaining := p.limit.Total - qState.Usage
 		if remaining < 0 {
 			remaining = 0
@@ -551,59 +634,76 @@ func (cs *ConfigStore) reloadQuotas(path string) error {
 	}
 
 	cs.mu.Lock()
+	defer cs.mu.Unlock()
 	now := time.Now()
 
 	for appName, extQuota := range externalQuotas {
-		target, exists := cs.quotas[appName]
-		appConfig, configExists := cs.config.ClientRegistry[appName]
-
-		if !exists || !configExists || appConfig.RateLimits == nil {
+		appConfig, exists := cs.config.ClientRegistry[appName]
+		if !exists {
 			continue
 		}
 
+		// 保留内存原有数据，只更新有效的数据
+		if _, exists := cs.quotas[appName]; !exists {
+			cs.quotas[appName] = &QuotaPeriods{}
+		}
+		quota := cs.quotas[appName]
 		rateLimits := appConfig.RateLimits
 
-		if extQuota.Hourly != nil && target.Hourly != nil && rateLimits["hourly"] != nil {
-			target.Hourly.Usage = extQuota.Hourly.Usage
-			if now.After(extQuota.Hourly.ResetAt) {
-				target.Hourly.Remaining = rateLimits["hourly"].Total
-			} else {
-				target.Hourly.Remaining = rateLimits["hourly"].Total - extQuota.Hourly.Usage
-			}
-			target.Hourly.ResetAt = extQuota.Hourly.ResetAt
+		periods := []struct {
+			name   string
+			limit  *RateLimitConfig
+			target **QuotaConfig
+		}{
+			{"hourly", rateLimits["hourly"], &quota.Hourly},
+			{"daily", rateLimits["daily"], &quota.Daily},
+			{"weekly", rateLimits["weekly"], &quota.Weekly},
+			{"monthly", rateLimits["monthly"], &quota.Monthly},
 		}
-		if extQuota.Daily != nil && target.Daily != nil && rateLimits["daily"] != nil {
-			target.Daily.Usage = extQuota.Daily.Usage
-			if now.After(extQuota.Daily.ResetAt) {
-				target.Daily.Remaining = rateLimits["daily"].Total
-			} else {
-				target.Daily.Remaining = rateLimits["daily"].Total - extQuota.Daily.Usage
+
+		for _, p := range periods {
+			if p.limit == nil || p.limit.Total <= 0 {
+				continue
 			}
-			target.Daily.ResetAt = extQuota.Daily.ResetAt
-		}
-		if extQuota.Weekly != nil && target.Weekly != nil && rateLimits["weekly"] != nil {
-			target.Weekly.Usage = extQuota.Weekly.Usage
-			if now.After(extQuota.Weekly.ResetAt) {
-				target.Weekly.Remaining = rateLimits["weekly"].Total
-			} else {
-				target.Weekly.Remaining = rateLimits["weekly"].Total - extQuota.Weekly.Usage
+
+			extCfg := getQuotaConfigByPeriod(extQuota, p.name)
+			// auto 文件数据有效：采用 auto 文件数据
+			if isValidUsage(extCfg, p.limit, p.name, now) {
+				if *p.target == nil {
+					*p.target = &QuotaConfig{}
+				}
+				(*p.target).Usage = extCfg.Usage
+				(*p.target).Remaining = p.limit.Total - extCfg.Usage
+				(*p.target).ResetAt = extCfg.ResetAt
+				if (*p.target).Remaining < 0 {
+					(*p.target).Remaining = 0
+				}
 			}
-			target.Weekly.ResetAt = extQuota.Weekly.ResetAt
-		}
-		if extQuota.Monthly != nil && target.Monthly != nil && rateLimits["monthly"] != nil {
-			target.Monthly.Usage = extQuota.Monthly.Usage
-			if now.After(extQuota.Monthly.ResetAt) {
-				target.Monthly.Remaining = rateLimits["monthly"].Total
-			} else {
-				target.Monthly.Remaining = rateLimits["monthly"].Total - extQuota.Monthly.Usage
-			}
-			target.Monthly.ResetAt = extQuota.Monthly.ResetAt
+			// auto 文件数据无效：保留内存原有数据（不覆盖）
 		}
 	}
-	cs.mu.Unlock()
 
-	cs.saveQuotas()
-	logger.Info("Reloaded auto_usage.json from user edit, saved updated remain values")
+	for appName := range cs.quotas {
+		if _, exists := cs.config.ClientRegistry[appName]; !exists {
+			delete(cs.quotas, appName)
+		}
+	}
 
+	go cs.saveQuotas()
 	return nil
+}
+
+func getQuotaConfigByPeriod(quota *QuotaPeriods, period string) *QuotaConfig {
+	switch period {
+	case "hourly":
+		return quota.Hourly
+	case "daily":
+		return quota.Daily
+	case "weekly":
+		return quota.Weekly
+	case "monthly":
+		return quota.Monthly
+	default:
+		return nil
+	}
 }

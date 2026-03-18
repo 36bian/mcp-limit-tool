@@ -78,7 +78,7 @@ func (s *StdioMCPProxy) Start() error {
 
 		response := s.handleRequest(line)
 		if response != "" {
-			fmt.Println(response)
+			fmt.Fprintln(os.Stdout, response)
 		}
 	}
 
