@@ -2,9 +2,11 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,21 +23,24 @@ func getConfigDir() string {
 
 // ConfigStore 管理配置热更新和限流计数
 type ConfigStore struct {
-	basePath string
-	config   *Config
-	quotas   map[string]*QuotaPeriods
-	mu       sync.RWMutex
-	watcher  *fsnotify.Watcher
-	stop     chan struct{}
-	saveChan chan struct{}
+	basePath    string
+	config      *Config
+	quotas      map[string]*QuotaPeriods
+	mu          sync.RWMutex
+	watcher     *fsnotify.Watcher
+	stop        chan struct{}
+	saveChan    chan struct{}
+	lastSaveMux sync.Mutex
+	lastSaveTime time.Time
 }
 
 
 
 // QuotaConfig 单个限流配置
 type QuotaConfig struct {
-	Usage   int64     `json:"usage"`
-	ResetAt time.Time `json:"reset_at,omitempty"`
+	Usage     int64     `json:"usage"`
+	Remaining int64     `json:"remain"`
+	ResetAt   time.Time `json:"reset_at,omitempty"`
 }
 
 // QuotaPeriods 所有周期配额
@@ -68,6 +73,9 @@ func NewConfigStore(basePath string, config *Config) (*ConfigStore, error) {
 	// 加载配置
 	cs.loadAll()
 
+	// 保存初始化后的 usage（根据 config 重新计算 remain）
+	cs.saveQuotas()
+
 	// 启动监听
 	go cs.watch()
 
@@ -75,7 +83,7 @@ func NewConfigStore(basePath string, config *Config) (*ConfigStore, error) {
 	go cs.autoSave()
 
 	configPath := filepath.Join(cs.basePath, "config.json")
-	usagePath := filepath.Join(cs.basePath, "usage.json")
+	usagePath := filepath.Join(cs.basePath, "auto_usage.json")
 	watcher.Add(filepath.Dir(configPath))
 	watcher.Add(filepath.Dir(usagePath))
 
@@ -89,7 +97,7 @@ func (cs *ConfigStore) loadAll() {
 
 	now := time.Now()
 
-	if data, err := os.ReadFile(filepath.Join(cs.basePath, "usage.json")); err == nil {
+	if data, err := os.ReadFile(filepath.Join(cs.basePath, "auto_usage.json")); err == nil {
 		sonic.Unmarshal(data, &cs.quotas)
 	}
 
@@ -171,7 +179,14 @@ func (cs *ConfigStore) reconcileQuota(quota *QuotaPeriods, rateLimits map[string
 
 		if quotaConfig.ResetAt.IsZero() {
 			quotaConfig.Usage = 0
+			quotaConfig.Remaining = limitConfig.Total
 			quotaConfig.ResetAt = getNextPeriodStart(period, now)
+		} else if now.After(quotaConfig.ResetAt) {
+			quotaConfig.Usage = 0
+			quotaConfig.Remaining = limitConfig.Total
+			quotaConfig.ResetAt = getNextPeriodStart(period, now)
+		} else {
+			quotaConfig.Remaining = limitConfig.Total - quotaConfig.Usage
 		}
 	}
 }
@@ -223,7 +238,8 @@ func (cs *ConfigStore) reloadConfig(path string) error {
 	}
 	cs.mu.Unlock()
 
-	cs.TriggerSave()
+	logger.Info("Config changed, saving usage immediately...")
+	cs.saveQuotas()
 
 	return nil
 }
@@ -247,20 +263,31 @@ func (cs *ConfigStore) watch() {
 			if !ok {
 				return
 			}
-			if event.Op&fsnotify.Write == fsnotify.Write || event.Op&fsnotify.Create == fsnotify.Create {
+			logger.Info(fmt.Sprintf("FS event: %v, path: %s", event.Op, event.Name))
+			if event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename) != 0 {
 				time.Sleep(100 * time.Millisecond)
 				basePath := cs.basePath
 				configPath := filepath.Join(basePath, "config.json")
-				usagePath := filepath.Join(basePath, "usage.json")
+				usagePath := filepath.Join(basePath, "auto_usage.json")
+
+				logger.Info(fmt.Sprintf("BasePath: %s, configPath: %s, usagePath: %s", basePath, configPath, usagePath))
 
 				if filepath.Base(event.Name) == "config.json" {
+					logger.Info("Calling reloadConfig for config.json")
 					if err := cs.reloadConfig(configPath); err == nil {
 						logger.Info("Reloaded config.json")
+					} else {
+						logger.Error("Failed to reload config.json: " + err.Error())
 					}
-				} else if filepath.Base(event.Name) == "usage.json" {
+				} else if filepath.Base(event.Name) == "auto_usage.json" {
+					logger.Info("Calling reloadQuotas for auto_usage.json")
 					if err := cs.reloadQuotas(usagePath); err == nil {
-						logger.Info("Reloaded usage.json from external modification")
+						logger.Info("Reloaded auto_usage.json from external modification")
+					} else {
+						logger.Error("Failed to reload auto_usage.json: " + err.Error())
 					}
+				} else {
+					logger.Info(fmt.Sprintf("Ignoring event for: %s", filepath.Base(event.Name)))
 				}
 			}
 		case err, ok := <-cs.watcher.Errors:
@@ -304,29 +331,66 @@ func (cs *ConfigStore) autoSave() {
 // saveQuotas 保存 quotas 到文件
 func (cs *ConfigStore) saveQuotas() {
 	cs.mu.RLock()
-	data := make(map[string]*QuotaPeriods)
-	for k, v := range cs.quotas {
-		data[k] = v
+	keys := make([]string, 0, len(cs.quotas))
+	for k := range cs.quotas {
+		keys = append(keys, k)
 	}
+	sort.Strings(keys)
+
+	periodOrder := []string{"hourly", "daily", "weekly", "monthly"}
+
+	var buf strings.Builder
+	buf.WriteString("{\n")
+	for i, app := range keys {
+		if i > 0 {
+			buf.WriteString(",\n")
+		}
+		buf.WriteString(fmt.Sprintf(`  "%s": {`, app))
+		periods := cs.quotas[app]
+		first := true
+		for _, p := range periodOrder {
+			var cfg *QuotaConfig
+			switch p {
+			case "hourly":
+				cfg = periods.Hourly
+			case "daily":
+				cfg = periods.Daily
+			case "weekly":
+				cfg = periods.Weekly
+			case "monthly":
+				cfg = periods.Monthly
+			}
+			if cfg == nil {
+				continue
+			}
+			if first {
+				buf.WriteString("\n")
+			} else {
+				buf.WriteString(",\n")
+			}
+			first = false
+			if !cfg.ResetAt.IsZero() {
+				buf.WriteString(fmt.Sprintf(`    "%s": {"usage": %d, "remain": %d, "reset_at": "%s"}`,
+					p, cfg.Usage, cfg.Remaining, cfg.ResetAt.Format(time.RFC3339)))
+			} else {
+				buf.WriteString(fmt.Sprintf(`    "%s": {"usage": %d, "remain": %d}`,
+					p, cfg.Usage, cfg.Remaining))
+			}
+		}
+		if first {
+			buf.WriteString("}")
+		} else {
+			buf.WriteString("\n  }")
+		}
+	}
+	buf.WriteString("\n}")
+
 	cs.mu.RUnlock()
 
-	path := filepath.Join(cs.basePath, "usage.json")
+	path := filepath.Join(cs.basePath, "auto_usage.json")
 	tmpPath := path + ".tmp"
 
-	content, err := sonic.MarshalIndent(data, "", "  ")
-	if err != nil {
-		logger.Error("Failed to marshal usage: " + err.Error())
-		return
-	}
-
-	strContent := string(content)
-	re1 := regexp.MustCompile(`\{\n\s+"usage": (\d+),\n\s+"reset_at": "([^"]+)"\n\s+\}`)
-	strContent = re1.ReplaceAllString(strContent, `{"usage": $1, "reset_at": "$2"}`)
-	re2 := regexp.MustCompile(`\{\n\s+"usage": (\d+)\n\s+\}`)
-	strContent = re2.ReplaceAllString(strContent, `{"usage": $1}`)
-	contentBytes := []byte(strContent)
-
-	if err := os.WriteFile(tmpPath, contentBytes, 0600); err != nil {
+	if err := os.WriteFile(tmpPath, []byte(buf.String()), 0600); err != nil {
 		logger.Error("Failed to write usage temp file: " + err.Error())
 		return
 	}
@@ -335,6 +399,10 @@ func (cs *ConfigStore) saveQuotas() {
 		logger.Error("Failed to rename usage file: " + err.Error())
 		return
 	}
+
+	cs.lastSaveMux.Lock()
+	cs.lastSaveTime = time.Now()
+	cs.lastSaveMux.Unlock()
 }
 
 // TriggerSave 触发保存
@@ -393,6 +461,7 @@ func (cs *ConfigStore) CheckAndInc(appName string) (allowed bool, details map[st
 
 		if now.After(qState.ResetAt) {
 			qState.Usage = 0
+			qState.Remaining = p.limit.Total
 			qState.ResetAt = getNextPeriodStart(p.name, now)
 		}
 
@@ -421,6 +490,7 @@ func (cs *ConfigStore) CheckAndInc(appName string) (allowed bool, details map[st
 	for _, p := range periods {
 		if p.limit != nil && p.limit.Total > 0 && *p.state != nil {
 			(*p.state).Usage++
+			(*p.state).Remaining--
 
 			if detail, exists := details[p.name]; exists && detail.Remaining > 0 {
 				detail.Remaining--
@@ -459,8 +529,17 @@ func getNextPeriodStart(period string, now time.Time) time.Time {
 	}
 }
 
-// reloadQuotas 专门用于处理外部人工对 usage.json 的修改
+// reloadQuotas 专门用于处理外部对 auto_usage.json 的修改
 func (cs *ConfigStore) reloadQuotas(path string) error {
+	cs.lastSaveMux.Lock()
+	recentSave := time.Since(cs.lastSaveTime) < 500*time.Millisecond
+	cs.lastSaveMux.Unlock()
+
+	if recentSave {
+		logger.Info("Skipping reloadQuotas - file was recently saved by us")
+		return nil
+	}
+
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return err
@@ -472,7 +551,7 @@ func (cs *ConfigStore) reloadQuotas(path string) error {
 	}
 
 	cs.mu.Lock()
-	defer cs.mu.Unlock()
+	now := time.Now()
 
 	for appName, extQuota := range externalQuotas {
 		target, exists := cs.quotas[appName]
@@ -486,21 +565,45 @@ func (cs *ConfigStore) reloadQuotas(path string) error {
 
 		if extQuota.Hourly != nil && target.Hourly != nil && rateLimits["hourly"] != nil {
 			target.Hourly.Usage = extQuota.Hourly.Usage
+			if now.After(extQuota.Hourly.ResetAt) {
+				target.Hourly.Remaining = rateLimits["hourly"].Total
+			} else {
+				target.Hourly.Remaining = rateLimits["hourly"].Total - extQuota.Hourly.Usage
+			}
 			target.Hourly.ResetAt = extQuota.Hourly.ResetAt
 		}
 		if extQuota.Daily != nil && target.Daily != nil && rateLimits["daily"] != nil {
 			target.Daily.Usage = extQuota.Daily.Usage
+			if now.After(extQuota.Daily.ResetAt) {
+				target.Daily.Remaining = rateLimits["daily"].Total
+			} else {
+				target.Daily.Remaining = rateLimits["daily"].Total - extQuota.Daily.Usage
+			}
 			target.Daily.ResetAt = extQuota.Daily.ResetAt
 		}
 		if extQuota.Weekly != nil && target.Weekly != nil && rateLimits["weekly"] != nil {
 			target.Weekly.Usage = extQuota.Weekly.Usage
+			if now.After(extQuota.Weekly.ResetAt) {
+				target.Weekly.Remaining = rateLimits["weekly"].Total
+			} else {
+				target.Weekly.Remaining = rateLimits["weekly"].Total - extQuota.Weekly.Usage
+			}
 			target.Weekly.ResetAt = extQuota.Weekly.ResetAt
 		}
 		if extQuota.Monthly != nil && target.Monthly != nil && rateLimits["monthly"] != nil {
 			target.Monthly.Usage = extQuota.Monthly.Usage
+			if now.After(extQuota.Monthly.ResetAt) {
+				target.Monthly.Remaining = rateLimits["monthly"].Total
+			} else {
+				target.Monthly.Remaining = rateLimits["monthly"].Total - extQuota.Monthly.Usage
+			}
 			target.Monthly.ResetAt = extQuota.Monthly.ResetAt
 		}
 	}
+	cs.mu.Unlock()
+
+	cs.saveQuotas()
+	logger.Info("Reloaded auto_usage.json from user edit, saved updated remain values")
 
 	return nil
 }
