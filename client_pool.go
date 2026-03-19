@@ -121,7 +121,10 @@ func (p *MCPClientPool) Acquire(ctx context.Context) (*PoolClient, error) {
 			if pc.client != nil {
 				pc.lastUsedAt = time.Now()
 
-				if int(atomic.LoadInt32(&p.currentSize)) < p.maxSize {
+				// 获取连接后，如果空闲连接不足 targetIdle，触发扩容
+				// 但避免每次获取都触发，只在当前空闲数 < targetIdle 时触发
+				currentIdle := len(p.clientChan)
+				if currentIdle < 2 && int(atomic.LoadInt32(&p.currentSize)) < p.maxSize {
 					p.triggerExpand()
 				}
 				return pc, nil
