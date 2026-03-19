@@ -137,6 +137,29 @@ func (p *MCPClientPool) Acquire(ctx context.Context) (*PoolClient, error) {
 	}
 }
 
+// AcquireNoExpand 获取一个客户端，但不触发扩容（用于 tools/list 等轻量级操作）
+func (p *MCPClientPool) AcquireNoExpand(ctx context.Context) (*PoolClient, error) {
+	p.mutex.Lock()
+	if !p.initialized {
+		p.mutex.Unlock()
+		return nil, fmt.Errorf("client pool not initialized")
+	}
+	p.mutex.Unlock()
+
+	for {
+		select {
+		case pc := <-p.clientChan:
+			if pc.client != nil {
+				pc.lastUsedAt = time.Now()
+				return pc, nil
+			}
+			atomic.AddInt32(&p.currentSize, -1)
+		case <-ctx.Done():
+			return nil, fmt.Errorf("timeout waiting for available client in pool (max: %d): %v", p.maxSize, ctx.Err())
+		}
+	}
+}
+
 // triggerExpand 触发异步扩展
 func (p *MCPClientPool) triggerExpand() {
 	select {
@@ -320,9 +343,10 @@ func (p *MCPClientPool) CallTool(ctx context.Context, request mcp.CallToolReques
 	return res, nil
 }
 
-// ListTools 使用连接池获取工具列表
+// ListTools 使用连接池获取工具列表（不触发扩容）
 func (p *MCPClientPool) ListTools(ctx context.Context, request mcp.ListToolsRequest) (*mcp.ListToolsResult, error) {
-	pc, err := p.Acquire(ctx)
+	// 使用 AcquireNoExpand，避免 tools/list 触发连接池扩容
+	pc, err := p.AcquireNoExpand(ctx)
 	if err != nil {
 		return nil, err
 	}
