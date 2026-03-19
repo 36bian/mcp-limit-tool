@@ -584,10 +584,6 @@ func runClientMode(appName string, config *Config) error {
 	}
 	defer conn.Close()
 
-	// 添加空闲超时，确保客户端进程不会无限期挂起
-	idleTimeout := 30 * time.Second
-	lastActivity := time.Now()
-
 	go func() {
 		reader := bufio.NewReader(conn)
 		for {
@@ -596,25 +592,6 @@ func runClientMode(appName string, config *Config) error {
 				return
 			}
 			fmt.Print(line)
-			lastActivity = time.Now()
-		}
-	}()
-
-	// 启动超时检查goroutine
-	done := make(chan struct{})
-	go func() {
-		ticker := time.NewTicker(5 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				if time.Since(lastActivity) > idleTimeout {
-					logger.Info(fmt.Sprintf("[%s] Client idle timeout, exiting", appName))
-					os.Exit(0)
-				}
-			case <-done:
-				return
-			}
 		}
 	}()
 
@@ -622,10 +599,8 @@ func runClientMode(appName string, config *Config) error {
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
-			close(done)
 			break
 		}
-		lastActivity = time.Now()
 
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -652,7 +627,6 @@ func runClientMode(appName string, config *Config) error {
 		}
 
 		if _, err := conn.Write([]byte(line + "\n")); err != nil {
-			close(done)
 			return err
 		}
 	}
