@@ -25,6 +25,7 @@ type MCPClientPool struct {
 	maxSize      int
 	currentSize  int32 // 原子计数，当前总客户端数（包括已借出）
 	mutex        sync.Mutex
+	expandMutex  sync.Mutex // 扩容互斥锁，避免并发过度创建
 	initialized  bool
 	initOnce     sync.Once // 确保初始化只执行一次
 	idleTimeout  time.Duration // 空闲超时时间
@@ -122,11 +123,11 @@ func (p *MCPClientPool) Acquire(ctx context.Context) (*PoolClient, error) {
 				pc.lastUsedAt = time.Now()
 
 				// 获取连接后，如果空闲连接不足 targetIdle，触发扩容
-				// 但避免每次获取都触发，只在当前空闲数 < targetIdle 时触发
-				currentIdle := len(p.clientChan)
-				if currentIdle < 2 && int(atomic.LoadInt32(&p.currentSize)) < p.maxSize {
-					p.triggerExpand()
-				}
+			// 但避免每次获取都触发，只在当前空闲数 < targetIdle 时触发
+			currentIdle := len(p.clientChan)
+			if currentIdle < 1 && int(atomic.LoadInt32(&p.currentSize)) < p.maxSize {
+				p.triggerExpand()
+			}
 				return pc, nil
 			}
 			atomic.AddInt32(&p.currentSize, -1)
@@ -151,7 +152,9 @@ func (p *MCPClientPool) startExpandWorker() {
 		for {
 			select {
 			case <-p.expandChan:
+				p.expandMutex.Lock()
 				p.asyncExpand()
+				p.expandMutex.Unlock()
 			case <-p.stopCleanup:
 				return
 			}
@@ -161,13 +164,15 @@ func (p *MCPClientPool) startExpandWorker() {
 
 // asyncExpand 异步扩展客户端池
 func (p *MCPClientPool) asyncExpand() {
+	// 重新计算实际需要创建的数量，避免并发时过度创建
 	currentTotal := int(atomic.LoadInt32(&p.currentSize))
 	chanLen := len(p.clientChan)
 
-	targetIdle := 2
+	targetIdle := 1
 	needCreate := targetIdle - chanLen
 
 	if needCreate <= 0 {
+		logger.Info(fmt.Sprintf("Async expand skipped: current=%d, idle=%d, target=%d", currentTotal, chanLen, targetIdle))
 		return
 	}
 
@@ -181,29 +186,35 @@ func (p *MCPClientPool) asyncExpand() {
 
 	logger.Info(fmt.Sprintf("Async expanding pool: current=%d, inChannel=%d, creating=%d", currentTotal, chanLen, needCreate))
 
+	// 同步创建，避免并发时过度创建
 	for i := 0; i < needCreate; i++ {
+		// 再次检查，避免重复创建
+		currentTotal = int(atomic.LoadInt32(&p.currentSize))
+		chanLen = len(p.clientChan)
+		if chanLen >= targetIdle || currentTotal >= p.maxSize {
+			break
+		}
+
 		if atomic.AddInt32(&p.currentSize, 1) > int32(p.maxSize) {
 			atomic.AddInt32(&p.currentSize, -1)
 			break
 		}
 
-		go func() {
-			newPc, err := p.createClient()
-			if err != nil {
-				logger.Error(fmt.Sprintf("Failed to create client during expand: %v", err))
-				atomic.AddInt32(&p.currentSize, -1)
-				return
-			}
+		newPc, err := p.createClient()
+		if err != nil {
+			logger.Error(fmt.Sprintf("Failed to create client during expand: %v", err))
+			atomic.AddInt32(&p.currentSize, -1)
+			continue
+		}
 
-			select {
-			case p.clientChan <- newPc:
-			default:
-				if newPc.client != nil {
-					newPc.client.Close()
-				}
-				atomic.AddInt32(&p.currentSize, -1)
+		select {
+		case p.clientChan <- newPc:
+		default:
+			if newPc.client != nil {
+				newPc.client.Close()
 			}
-		}()
+			atomic.AddInt32(&p.currentSize, -1)
+		}
 	}
 }
 
