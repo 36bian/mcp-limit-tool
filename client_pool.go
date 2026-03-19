@@ -17,7 +17,7 @@ type PoolClient struct {
 	lastUsedAt time.Time
 }
 
-// MCPClientPool MCP客户端连接池 - 异步动态扩展模式
+// MCPClientPool MCP客户端连接池 - 由DaemonServer统一管理协程
 type MCPClientPool struct {
 	registry     *AppConfig
 	clients      []*PoolClient
@@ -29,11 +29,11 @@ type MCPClientPool struct {
 	initialized  bool
 	initOnce     sync.Once // 确保初始化只执行一次
 	idleTimeout  time.Duration // 空闲超时时间
-	stopCleanup  chan struct{}
-	expandChan   chan struct{} // 扩展信号
+	needExpand   bool          // 标记是否需要扩容（由DaemonServer检查）
+	poolMutex    sync.RWMutex  // 保护needExpand字段
 }
 
-// NewMCPClientPool 创建新的客户端连接池
+// NewMCPClientPool 创建新的客户端连接池（不再启动独立协程，由DaemonServer统一管理）
 func NewMCPClientPool(registry *AppConfig, maxSize int) *MCPClientPool {
 	pool := &MCPClientPool{
 		registry:    registry,
@@ -41,13 +41,8 @@ func NewMCPClientPool(registry *AppConfig, maxSize int) *MCPClientPool {
 		clients:     make([]*PoolClient, 0),
 		clientChan:  make(chan *PoolClient, maxSize),
 		idleTimeout: 5 * time.Minute,
-		stopCleanup: make(chan struct{}),
-		expandChan:  make(chan struct{}, 10),
+		needExpand:  false,
 	}
-	// 启动清理协程
-	pool.startCleanupWorker()
-	// 启动异步扩展协程
-	pool.startExpandWorker()
 	return pool
 }
 
@@ -75,7 +70,8 @@ func (p *MCPClientPool) Initialize() error {
 		p.initialized = true
 		p.mutex.Unlock()
 
-		p.triggerExpand()
+		// 标记需要扩容，由DaemonServer统一处理
+		p.MarkExpand()
 	})
 
 	p.mutex.Lock()
@@ -86,6 +82,28 @@ func (p *MCPClientPool) Initialize() error {
 		return fmt.Errorf("failed to initialize client pool")
 	}
 	return nil
+}
+
+// MarkExpand 标记需要扩容（DaemonServer会统一处理）
+func (p *MCPClientPool) MarkExpand() {
+	p.poolMutex.Lock()
+	p.needExpand = true
+	p.poolMutex.Unlock()
+}
+
+// ShouldExpand 检查是否需要扩容（由DaemonServer调用）
+// 注意：返回true后，DaemonServer应该调用DoExpandAndClear，而不是单独调用DoExpand
+func (p *MCPClientPool) ShouldExpand() bool {
+	p.poolMutex.RLock()
+	defer p.poolMutex.RUnlock()
+	return p.needExpand
+}
+
+// ClearExpandFlag 清除扩容标记（在扩容完成后调用）
+func (p *MCPClientPool) ClearExpandFlag() {
+	p.poolMutex.Lock()
+	p.needExpand = false
+	p.poolMutex.Unlock()
 }
 
 // createClient 创建一个新的客户端
@@ -113,7 +131,7 @@ func (p *MCPClientPool) Acquire(ctx context.Context) (*PoolClient, error) {
 
 	currentTotal := int(atomic.LoadInt32(&p.currentSize))
 	if currentTotal < p.maxSize && len(p.clientChan) == 0 {
-		p.triggerExpand()
+		p.MarkExpand()
 	}
 
 	for {
@@ -122,12 +140,11 @@ func (p *MCPClientPool) Acquire(ctx context.Context) (*PoolClient, error) {
 			if pc.client != nil {
 				pc.lastUsedAt = time.Now()
 
-				// 获取连接后，如果空闲连接不足 targetIdle，触发扩容
-			// 但避免每次获取都触发，只在当前空闲数 < targetIdle 时触发
-			currentIdle := len(p.clientChan)
-			if currentIdle < 1 && int(atomic.LoadInt32(&p.currentSize)) < p.maxSize {
-				p.triggerExpand()
-			}
+				// 获取连接后，如果空闲连接不足 targetIdle，标记需要扩容
+				currentIdle := len(p.clientChan)
+				if currentIdle < 1 && int(atomic.LoadInt32(&p.currentSize)) < p.maxSize {
+					p.MarkExpand()
+				}
 				return pc, nil
 			}
 			atomic.AddInt32(&p.currentSize, -1)
@@ -160,33 +177,11 @@ func (p *MCPClientPool) AcquireNoExpand(ctx context.Context) (*PoolClient, error
 	}
 }
 
-// triggerExpand 触发异步扩展
-func (p *MCPClientPool) triggerExpand() {
-	select {
-	case p.expandChan <- struct{}{}:
-	default:
-		// 扩展信号已存在，不重复发送
-	}
-}
+// DoExpand 执行扩容（由DaemonServer统一调用）
+func (p *MCPClientPool) DoExpand() {
+	p.expandMutex.Lock()
+	defer p.expandMutex.Unlock()
 
-// startExpandWorker 启动异步扩展工作协程
-func (p *MCPClientPool) startExpandWorker() {
-	go func() {
-		for {
-			select {
-			case <-p.expandChan:
-				p.expandMutex.Lock()
-				p.asyncExpand()
-				p.expandMutex.Unlock()
-			case <-p.stopCleanup:
-				return
-			}
-		}
-	}()
-}
-
-// asyncExpand 异步扩展客户端池
-func (p *MCPClientPool) asyncExpand() {
 	// 重新计算实际需要创建的数量，避免并发时过度创建
 	currentTotal := int(atomic.LoadInt32(&p.currentSize))
 	chanLen := len(p.clientChan)
@@ -195,7 +190,6 @@ func (p *MCPClientPool) asyncExpand() {
 	needCreate := targetIdle - chanLen
 
 	if needCreate <= 0 {
-		logger.Info(fmt.Sprintf("Async expand skipped: current=%d, idle=%d, target=%d", currentTotal, chanLen, targetIdle))
 		return
 	}
 
@@ -207,7 +201,7 @@ func (p *MCPClientPool) asyncExpand() {
 		return
 	}
 
-	logger.Info(fmt.Sprintf("Async expanding pool: current=%d, inChannel=%d, creating=%d", currentTotal, chanLen, needCreate))
+	logger.Info(fmt.Sprintf("Expanding pool: current=%d, inChannel=%d, creating=%d", currentTotal, chanLen, needCreate))
 
 	// 同步创建，避免并发时过度创建
 	for i := 0; i < needCreate; i++ {
@@ -270,31 +264,14 @@ func (p *MCPClientPool) Discard(pc *PoolClient) {
 	atomic.AddInt32(&p.currentSize, -1)
 
 	if int(atomic.LoadInt32(&p.currentSize)) < p.maxSize {
-		p.triggerExpand()
+		p.MarkExpand()
 	}
 }
 
-// startCleanupWorker 启动清理工作协程
-func (p *MCPClientPool) startCleanupWorker() {
-	go func() {
-		ticker := time.NewTicker(30 * time.Second) // 每30秒检查一次
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ticker.C:
-				p.cleanupIdleClients()
-			case <-p.stopCleanup:
-				return
-			}
-		}
-	}()
-}
-
-// cleanupIdleClients 清理空闲超时的客户端
-func (p *MCPClientPool) cleanupIdleClients() {
+// CleanupIdleClients 清理空闲超时的客户端（由DaemonServer统一调用）
+func (p *MCPClientPool) CleanupIdleClients() int {
 	if !p.initialized {
-		return
+		return 0
 	}
 
 	now := time.Now()
@@ -305,11 +282,12 @@ func (p *MCPClientPool) cleanupIdleClients() {
 		select {
 		case pc := <-p.clientChan:
 			if now.Sub(pc.lastUsedAt) > p.idleTimeout {
+				// 关闭客户端（即使是nil也要减少计数）
 				if pc.client != nil {
 					go pc.client.Close()
-					closedCount++
-					atomic.AddInt32(&p.currentSize, -1)
 				}
+				closedCount++
+				atomic.AddInt32(&p.currentSize, -1)
 			} else {
 				select {
 				case p.clientChan <- pc:
@@ -321,9 +299,7 @@ func (p *MCPClientPool) cleanupIdleClients() {
 		}
 	}
 
-	if closedCount > 0 {
-		logger.Info(fmt.Sprintf("Cleaned up %d idle clients (idle > %v)", closedCount, p.idleTimeout))
-	}
+	return closedCount
 }
 
 // CallTool 使用连接池执行工具调用
@@ -363,9 +339,6 @@ func (p *MCPClientPool) ListTools(ctx context.Context, request mcp.ListToolsRequ
 
 // Close 关闭连接池中的所有客户端
 func (p *MCPClientPool) Close() {
-	// 停止清理协程
-	close(p.stopCleanup)
-
 	// 关闭 channel 中的客户端
 	for {
 		select {

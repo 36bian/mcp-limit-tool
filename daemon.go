@@ -57,6 +57,9 @@ type DaemonServer struct {
 	idleTimer      *time.Timer   // 空闲自毁定时器
 	lifecycleMu    sync.Mutex    // 生命周期锁
 	shutdownChan   chan struct{} // 触发关闭的信号通道
+
+	// 统一管理所有连接池的协程控制
+	poolManagerStop chan struct{} // 停止连接池管理协程
 }
 
 // isDaemonRunning 检查守护进程是否正在运行
@@ -163,6 +166,7 @@ func runDaemonMode(config *Config, configPath string) {
 	rateEngine := NewRateLimitEngine(configStore)
 
 	shutdownChan := make(chan struct{})
+	poolManagerStop := make(chan struct{})
 
 	go func() {
 		for {
@@ -173,11 +177,13 @@ func runDaemonMode(config *Config, configPath string) {
 					continue
 				}
 				logger.Info(fmt.Sprintf("Received %v, shutting down gracefully...", sig))
+				close(poolManagerStop)
 				configStore.Stop()
 				os.Remove(daemonSocketPath)
 				os.Exit(0)
 			case <-shutdownChan:
 				logger.Info("Auto-shutdown executed. Cleaning up resources...")
+				close(poolManagerStop)
 				configStore.Stop()
 				os.Remove(daemonSocketPath)
 				os.Exit(0)
@@ -204,15 +210,19 @@ func runDaemonMode(config *Config, configPath string) {
 	}
 
 	server := &DaemonServer{
-		listener:     listener,
-		config:       config,
-		configPath:   configPath,
-		proxies:      make(map[string]*DaemonProxy),
-		configStore:  configStore,
-		rateEngine:   rateEngine,
-		sem:          make(chan struct{}, 100),
-		shutdownChan: shutdownChan,
+		listener:        listener,
+		config:          config,
+		configPath:      configPath,
+		proxies:         make(map[string]*DaemonProxy),
+		configStore:     configStore,
+		rateEngine:      rateEngine,
+		sem:             make(chan struct{}, 100),
+		shutdownChan:    shutdownChan,
+		poolManagerStop: poolManagerStop,
 	}
+
+	// 启动统一管理协程（2个协程管理所有连接池）
+	server.startPoolManager()
 
 	server.lifecycleMu.Lock()
 	server.idleTimer = time.AfterFunc(10*time.Minute, func() {
@@ -286,6 +296,85 @@ func (ds *DaemonServer) getOrCreateProxy(appName string) (*DaemonProxy, error) {
 	ds.proxies[appName] = proxy
 	logger.Info(fmt.Sprintf("Created proxy for %s with client pool (max=30)", appName))
 	return proxy, nil
+}
+
+// startPoolManager 启动统一管理所有连接池的协程（2个协程替代原来的 N*2 个）
+func (ds *DaemonServer) startPoolManager() {
+	// 协程1：定期检查所有连接池的空闲客户端并清理
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				ds.cleanupAllIdleClients()
+			case <-ds.poolManagerStop:
+				return
+			}
+		}
+	}()
+
+	// 协程2：定期检查所有连接池的扩容需求
+	go func() {
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				ds.expandAllPools()
+			case <-ds.poolManagerStop:
+				return
+			}
+		}
+	}()
+
+	logger.Info("Pool manager started (2 goroutines for all pools)")
+}
+
+// cleanupAllIdleClients 清理所有连接池的空闲客户端
+func (ds *DaemonServer) cleanupAllIdleClients() {
+	ds.mutex.RLock()
+	proxies := make([]*DaemonProxy, 0, len(ds.proxies))
+	for _, proxy := range ds.proxies {
+		proxies = append(proxies, proxy)
+	}
+	ds.mutex.RUnlock()
+
+	totalClosed := 0
+	for _, proxy := range proxies {
+		if proxy.proxy != nil && proxy.proxy.clientPool != nil {
+			closed := proxy.proxy.clientPool.CleanupIdleClients()
+			totalClosed += closed
+		}
+	}
+
+	if totalClosed > 0 {
+		logger.Info(fmt.Sprintf("Cleaned up %d idle clients from all pools", totalClosed))
+	}
+}
+
+// expandAllPools 检查并扩容所有需要扩容的连接池
+func (ds *DaemonServer) expandAllPools() {
+	ds.mutex.RLock()
+	proxies := make([]*DaemonProxy, 0, len(ds.proxies))
+	for _, proxy := range ds.proxies {
+		proxies = append(proxies, proxy)
+	}
+	ds.mutex.RUnlock()
+
+	for _, proxy := range proxies {
+		if proxy.proxy != nil && proxy.proxy.clientPool != nil {
+			if proxy.proxy.clientPool.ShouldExpand() {
+				// 在协程中执行扩容，并在完成后清除标记
+				go func(pool *MCPClientPool) {
+					pool.DoExpand()
+					pool.ClearExpandFlag()
+				}(proxy.proxy.clientPool)
+			}
+		}
+	}
 }
 
 // startIdleTimer 启动空闲超时定时器
@@ -412,12 +501,10 @@ func (ds *DaemonServer) handleValidApp(conn net.Conn, reader *bufio.Reader, writ
 	// 更新最后使用时间
 	proxy.updateLastUsed()
 
-	// 异步扩展连接池（创建更多备用）
-	go func() {
-		if proxy.proxy != nil && proxy.proxy.clientPool != nil {
-			proxy.proxy.clientPool.triggerExpand()
-		}
-	}()
+	// 标记需要扩容（由DaemonServer统一管理）
+	if proxy.proxy != nil && proxy.proxy.clientPool != nil {
+		proxy.proxy.clientPool.MarkExpand()
+	}
 
 	// 处理请求
 	ds.processRequest(conn, reader, writer, writeMu, line, appName, proxy.proxy, reqId)
@@ -497,6 +584,10 @@ func runClientMode(appName string, config *Config) error {
 	}
 	defer conn.Close()
 
+	// 添加空闲超时，确保客户端进程不会无限期挂起
+	idleTimeout := 30 * time.Second
+	lastActivity := time.Now()
+
 	go func() {
 		reader := bufio.NewReader(conn)
 		for {
@@ -505,6 +596,25 @@ func runClientMode(appName string, config *Config) error {
 				return
 			}
 			fmt.Print(line)
+			lastActivity = time.Now()
+		}
+	}()
+
+	// 启动超时检查goroutine
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if time.Since(lastActivity) > idleTimeout {
+					logger.Info(fmt.Sprintf("[%s] Client idle timeout, exiting", appName))
+					os.Exit(0)
+				}
+			case <-done:
+				return
+			}
 		}
 	}()
 
@@ -512,8 +622,10 @@ func runClientMode(appName string, config *Config) error {
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
+			close(done)
 			break
 		}
+		lastActivity = time.Now()
 
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -540,6 +652,7 @@ func runClientMode(appName string, config *Config) error {
 		}
 
 		if _, err := conn.Write([]byte(line + "\n")); err != nil {
+			close(done)
 			return err
 		}
 	}
