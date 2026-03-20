@@ -294,43 +294,17 @@ func (ds *DaemonServer) getOrCreateProxy(appName string) (*DaemonProxy, error) {
 	proxy.startIdleTimer(ds)
 
 	ds.proxies[appName] = proxy
-	logger.Info(fmt.Sprintf("Created proxy for %s with client pool (max=30)", appName))
+	logger.Info(fmt.Sprintf("Created proxy for %s with multiplexed client (single connection)", appName))
 	return proxy, nil
 }
 
-// startPoolManager 启动统一管理所有连接池的协程（2个协程替代原来的 N*2 个）
+// startPoolManager 启动统一管理所有连接池的协程
+// 已废除原有的协程池管理，现采用单一长连接多路复用
+// JSON-RPC 协议原生支持在单一连接上并发处理多个请求，无需连接池
 func (ds *DaemonServer) startPoolManager() {
-	// 协程1：定期检查所有连接池的空闲客户端并清理
-	go func() {
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ticker.C:
-				ds.cleanupAllIdleClients()
-			case <-ds.poolManagerStop:
-				return
-			}
-		}
-	}()
-
-	// 协程2：定期检查所有连接池的扩容需求
-	go func() {
-		ticker := time.NewTicker(1 * time.Second)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ticker.C:
-				ds.expandAllPools()
-			case <-ds.poolManagerStop:
-				return
-			}
-		}
-	}()
-
-	logger.Info("Pool manager started (2 goroutines for all pools)")
+	// 已废除原有的协程池管理。
+	// 现采用单一长连接多路复用，彻底消除定期轮询扩容/清理带来的 CPU 唤醒开销。
+	logger.Info("Pool manager disabled (using zero-overhead multiplexed connection)")
 }
 
 // cleanupAllIdleClients 清理所有连接池的空闲客户端
