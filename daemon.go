@@ -307,50 +307,6 @@ func (ds *DaemonServer) startPoolManager() {
 	logger.Info("Pool manager disabled (using zero-overhead multiplexed connection)")
 }
 
-// cleanupAllIdleClients 清理所有连接池的空闲客户端
-func (ds *DaemonServer) cleanupAllIdleClients() {
-	ds.mutex.RLock()
-	proxies := make([]*DaemonProxy, 0, len(ds.proxies))
-	for _, proxy := range ds.proxies {
-		proxies = append(proxies, proxy)
-	}
-	ds.mutex.RUnlock()
-
-	totalClosed := 0
-	for _, proxy := range proxies {
-		if proxy.proxy != nil && proxy.proxy.clientPool != nil {
-			closed := proxy.proxy.clientPool.CleanupIdleClients()
-			totalClosed += closed
-		}
-	}
-
-	if totalClosed > 0 {
-		logger.Info(fmt.Sprintf("Cleaned up %d idle clients from all pools", totalClosed))
-	}
-}
-
-// expandAllPools 检查并扩容所有需要扩容的连接池
-func (ds *DaemonServer) expandAllPools() {
-	ds.mutex.RLock()
-	proxies := make([]*DaemonProxy, 0, len(ds.proxies))
-	for _, proxy := range ds.proxies {
-		proxies = append(proxies, proxy)
-	}
-	ds.mutex.RUnlock()
-
-	for _, proxy := range proxies {
-		if proxy.proxy != nil && proxy.proxy.clientPool != nil {
-			if proxy.proxy.clientPool.ShouldExpand() {
-				// 在协程中执行扩容，并在完成后清除标记
-				go func(pool *MCPClientPool) {
-					pool.DoExpand()
-					pool.ClearExpandFlag()
-				}(proxy.proxy.clientPool)
-			}
-		}
-	}
-}
-
 // startIdleTimer 启动空闲超时定时器
 func (dp *DaemonProxy) startIdleTimer(ds *DaemonServer) {
 	dp.idleTimer = time.AfterFunc(5*time.Minute, func() {
@@ -474,11 +430,6 @@ func (ds *DaemonServer) handleValidApp(conn net.Conn, reader *bufio.Reader, writ
 
 	// 更新最后使用时间
 	proxy.updateLastUsed()
-
-	// 标记需要扩容（由DaemonServer统一管理）
-	if proxy.proxy != nil && proxy.proxy.clientPool != nil {
-		proxy.proxy.clientPool.MarkExpand()
-	}
 
 	// 处理请求
 	ds.processRequest(conn, reader, writer, writeMu, line, appName, proxy.proxy, reqId)
